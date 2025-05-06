@@ -9,7 +9,6 @@ async function startCampaign(
   const [owner] = await ethers.getSigners();
   console.log(`Owner address: ${owner.address}`);
 
-  // Get token contract and approve airdrop to spend tokens
   const token = await ethers.getContractAt("TestToken", tokenAddress);
   console.log(`Connected to Token contract at: ${await token.getAddress()}`);
 
@@ -18,7 +17,6 @@ async function startCampaign(
   await approveTx.wait();
   console.log(`Approval confirmed in tx: ${approveTx.hash}`);
 
-  // Start campaign
   const airdrop = await ethers.getContractAt("Airdrop", contractAddress);
   console.log(`Connected to Airdrop contract at: ${await airdrop.getAddress()}`);
 
@@ -34,12 +32,12 @@ async function startCampaign(
   const campaignId = await airdrop.id();
   console.log(`New campaign ID: ${campaignId}`);
 
-  // Verify token balance was transferred
-  const airdropBalance = await token.balanceOf(contractAddress);
+  const contr = await ethers.getImpersonatedSigner(contractAddress)
+  const airdropBalance = await token.balanceOf(contr);
   console.log(`Airdrop contract token balance: ${ethers.formatEther(airdropBalance)}`);
 }
 
-await startCampaign(
+startCampaign(
   "0x5FbDB2315678afecb367f032d93F642f64180aa3",
   "0xe7f1725E7734CE288F8367e1Bb143E90bb3F0512",
   ethers.parseEther("1000"),

@@ -1,11 +1,12 @@
 import { loadFixture } from "@nomicfoundation/hardhat-toolbox/network-helpers";
-import { ethers, network } from "hardhat";
+import { ethers } from "hardhat";
 import { expect } from "chai";
 import "@nomicfoundation/hardhat-chai-matchers";
+import { MerkleTree } from "merkletreejs";
 
-describe("Airdrop", function () {
+describe("Airdrop (Merkle Tree Version)", function () {
   async function deployAirdropFixture() {
-    const [owner, user1, user2] = await ethers.getSigners();
+    const [owner, user1, user2, user3] = await ethers.getSigners();
 
     const TokenFactory = await ethers.getContractFactory("TestToken", owner);
     const token = await TokenFactory.deploy("TestToken", "TTK", 18);
@@ -17,12 +18,38 @@ describe("Airdrop", function () {
     const airdrop = await AirdropFactory.deploy(owner.address);
     await airdrop.waitForDeployment();
 
-    return { owner, user1, user2, token, airdrop };
+    return { owner, user1, user2, user3, token, airdrop };
   }
+
+  function createMerkleTree(recipients: {address: string, amount: bigint}[]) {
+    const leaves = recipients.map(r => 
+        ethers.keccak256(
+            ethers.solidityPacked(
+                ["address", "uint256"],
+                [r.address, r.amount]
+            )
+        )
+    );
+    
+    const tree = new MerkleTree(leaves, ethers.keccak256, { sort: true });
+    return { 
+        tree, 
+        root: tree.getHexRoot(),
+        getProof: (address: string, amount: bigint) => {
+            const leaf = ethers.keccak256(
+                ethers.solidityPacked(
+                    ["address", "uint256"],
+                    [address, amount]
+                )
+            );
+            return tree.getHexProof(leaf);
+        }
+    };
+}
 
   describe("Start Campaign", function () {
     it("should start a new campaign", async function () {
-      const { owner, token, airdrop } = await loadFixture(deployAirdropFixture);
+      const { token, airdrop } = await loadFixture(deployAirdropFixture);
 
       const totalAllocated = ethers.parseEther("1000");
       await token.approve(await airdrop.getAddress(), totalAllocated);
@@ -32,6 +59,7 @@ describe("Airdrop", function () {
 
       const campaign = await airdrop.campaigns(1);
       expect(campaign.token).to.equal(await token.getAddress());
+      expect(campaign.finalized).to.be.false;
     });
 
     it("should revert with empty address", async function () {
@@ -43,350 +71,414 @@ describe("Airdrop", function () {
     });
   });
 
-  describe("Upload Participants", function () {
-    it("should upload participants", async function () {
+  describe("Finalize Campaign", function () {
+    it("should finalize a campaign with merkle root", async function () {
       const { user1, user2, token, airdrop } = await loadFixture(deployAirdropFixture);
 
       const totalAllocated = ethers.parseEther("1000");
       await token.approve(await airdrop.getAddress(), totalAllocated);
       await airdrop.startCampaign(await token.getAddress(), totalAllocated);
 
-      const participants = [
-        { user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 },
-        { user: user2.address, amount: ethers.parseEther("200"), campaignId: 1 }
+      const recipients = [
+        { address: user1.address, amount: ethers.parseEther("300") },
+        { address: user2.address, amount: ethers.parseEther("700") }
       ];
+      const { root } = await createMerkleTree(recipients);
 
-      await expect(airdrop.uploadParticipants(participants, 2)).to.emit(airdrop, "NewAirdropParticipants");
-
-      expect(await airdrop.campaignDistribution(1, user1.address)).to.equal(ethers.parseEther("100"));
-      expect(await airdrop.campaignDistribution(1, user2.address)).to.equal(ethers.parseEther("200"));
-    });
-
-    it("should revert on empty array", async function () {
-      const { airdrop } = await loadFixture(deployAirdropFixture);
-
-      await expect(airdrop.uploadParticipants([], 1)).to.be.revertedWithCustomError(airdrop, "EmptyDistributionArray");
-    });
-  });
-
-  describe("Finalize Campaign", function () {
-    it("should finalize a campaign", async function () {
-      const { token, airdrop } = await loadFixture(deployAirdropFixture);
-
-      const totalAllocated = ethers.parseEther("1000");
-      await token.approve(await airdrop.getAddress(), totalAllocated);
-      await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-
-      const now = (await ethers.provider.getBlock("latest")).timestamp;
-
-      await expect(airdrop.finalizeCampaign(1, now + 10, 30)).to.not.be.reverted;
+      const vestingStart = (await ethers.provider.getBlock('latest'))!.timestamp + 100;
+      const duration = 30; 
+      await expect(airdrop.finalizeCampaign(1, vestingStart, duration, root))
+        .to.emit(airdrop, "CampaignFinalized");
 
       const campaign = await airdrop.campaigns(1);
       expect(campaign.finalized).to.be.true;
+      expect(campaign.merkleRoot).to.equal(root);
     });
 
-    it("should revert if start time is in the past", async function () {
+    it("should revert if finalizing already finalized campaign", async function () {
       const { token, airdrop } = await loadFixture(deployAirdropFixture);
 
       const totalAllocated = ethers.parseEther("1000");
       await token.approve(await airdrop.getAddress(), totalAllocated);
       await airdrop.startCampaign(await token.getAddress(), totalAllocated);
 
-      const now = (await ethers.provider.getBlock("latest")).timestamp;
+      const vestingStart = (await ethers.provider.getBlock('latest'))!.timestamp + 100;
+      await airdrop.finalizeCampaign(1, vestingStart, 30, ethers.ZeroHash);
 
-      await expect(airdrop.finalizeCampaign(1, now - 1, 30)).to.be.revertedWithCustomError(airdrop, "NotAllowedStartCampaignInPast");
+      await expect(
+        airdrop.finalizeCampaign(1, vestingStart, 30, ethers.ZeroHash)
+      ).to.be.revertedWithCustomError(airdrop, "CampaignAlreadyFinalized");
+    });
+
+    it("should revert if vesting starts in past", async function () {
+      const { token, airdrop } = await loadFixture(deployAirdropFixture);
+
+      await token.approve(await airdrop.getAddress(), ethers.parseEther("1000"));
+      await airdrop.startCampaign(await token.getAddress(), ethers.parseEther("1000"));
+
+      const pastTime = (await ethers.provider.getBlock('latest'))!.timestamp - 100;
+      await expect(
+        airdrop.finalizeCampaign(1, pastTime, 30, ethers.ZeroHash)
+      ).to.be.revertedWithCustomError(airdrop, "NotAllowedStartCampaignInPast");
     });
   });
 
   describe("Claim Tokens", function () {
-    it("should allow user to claim tokens", async function () {
+    it("should calculate correct vested amount during vesting period", async function () {
       const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-
-      const totalAllocated = ethers.parseEther("1000");
-      await token.approve(await airdrop.getAddress(), totalAllocated);
-      await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-
-      const participants = [
-        { user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }
-      ];
-      await airdrop.uploadParticipants(participants, 1);
-
-      const now = (await ethers.provider.getBlock("latest")).timestamp;
-      await airdrop.finalizeCampaign(1, now + 1, 1);
-
-      await network.provider.send("evm_increaseTime", [2 * 86400]);
-      await network.provider.send("evm_mine");
-
-      const beforeBalance = await token.balanceOf(user1.address);
-
-      await expect(airdrop.connect(user1).claim(1, ethers.parseEther("50"))).to.not.be.reverted;
-
-      const afterBalance = await token.balanceOf(user1.address);
-
-      expect(afterBalance - beforeBalance).to.equal(ethers.parseEther("50"));
+    
+      const amount = ethers.parseEther("1000");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+    
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+    
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 10, root);
+    
+      await ethers.provider.send("evm_increaseTime", [5 * 86400]);
+      await ethers.provider.send("evm_mine");
+    
+      await airdrop.connect(user1).claim(1, amount, proof);
+      const expectedAmount = amount / 2n;
+      expect(await token.balanceOf(user1.address)).to.be.closeTo(
+        expectedAmount,
+        expectedAmount / 100n 
+      );
     });
 
-    it("should revert if claiming too much", async function () {
+    it("should not allow multiple claims during vesting", async function () {
+      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+    
+      const amount = ethers.parseEther("1000");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+    
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+    
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 10, root);
+    
+      await ethers.provider.send("evm_increaseTime", [2 * 86400]);
+      await ethers.provider.send("evm_mine");
+    
+      await airdrop.connect(user1).claim(1, amount, proof);
+    
+      await expect(airdrop.connect(user1).claim(1, amount, proof)).to.be.revertedWithCustomError(airdrop, "AlreadyClaimed")
+    });
+
+    it("should revert if claiming before vesting starts", async function () {
+      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+    
+      const amount = ethers.parseEther("500");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+    
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+    
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 86400, 1, root);
+    
+      await expect(
+        airdrop.connect(user1).claim(1, amount, proof)
+      ).to.be.revertedWithCustomError(airdrop, "CampaignNotAllowed");
+    });
+
+    it("should revert if campaign not finalized", async function () {
+      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+    
+      const amount = ethers.parseEther("500");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+    
+      const recipients = [{ address: user1.address, amount }];
+      const { getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+    
+      await expect(
+        airdrop.connect(user1).claim(1, amount, proof)
+      ).to.be.revertedWithCustomError(airdrop, "CampaignNotAllowed");
+    });
+
+    it("should allow claiming full amount after vesting ends", async function () {
+      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+    
+      const amount = ethers.parseEther("500");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+    
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+    
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 1, root);
+    
+      await ethers.provider.send("evm_increaseTime", [86400 + 1]);
+      await ethers.provider.send("evm_mine");
+    
+      await expect(airdrop.connect(user1).claim(1, amount, proof))
+        .to.emit(airdrop, "TokensClaimed")
+        .withArgs(1, user1.address, amount);
+    
+      expect(await airdrop.hasClaimed(1, user1.address)).to.be.true;
+      expect(await token.balanceOf(user1.address)).to.equal(amount);
+    });
+
+    it("should allow partial claim during vesting", async function () {
       const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
 
-      const totalAllocated = ethers.parseEther("1000");
-      await token.approve(await airdrop.getAddress(), totalAllocated);
-      await airdrop.startCampaign(await token.getAddress(), totalAllocated);
+      const amount = ethers.parseEther("1000");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
 
-      const participants = [
-        { user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }
-      ];
-      await airdrop.uploadParticipants(participants, 1);
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
 
-      const now = (await ethers.provider.getBlock("latest")).timestamp;
-      await airdrop.finalizeCampaign(1, now + 1, 1);
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 1, root);
+    
+      await ethers.provider.send("evm_increaseTime", [86400 + 1]);
+      await ethers.provider.send("evm_mine");
 
-      await network.provider.send("evm_increaseTime", [2 * 86400]);
-      await network.provider.send("evm_mine");
+      const expectedAmount = amount
+      await expect(airdrop.connect(user1).claim(1, amount, proof))
+        .to.emit(airdrop, "TokensClaimed")
+        .withArgs(1, user1.address, expectedAmount);
 
-      await expect(airdrop.connect(user1).claim(1, ethers.parseEther("200"))).to.be.revertedWithCustomError(airdrop, "TooManyForWitdraw");
+      expect(await airdrop.hasClaimed(1, user1.address)).to.be.true;
+      expect(await token.balanceOf(user1.address)).to.equal(expectedAmount);
+    });
+
+    it("should revert with invalid proof", async function () {
+      const { user1, user2, token, airdrop } = await loadFixture(deployAirdropFixture);
+
+      const amount = ethers.parseEther("500");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 1, root);
+    
+      await ethers.provider.send("evm_increaseTime", [86400 + 1]);
+      await ethers.provider.send("evm_mine");
+
+      await expect(
+        airdrop.connect(user2).claim(1, amount, proof)
+      ).to.be.revertedWithCustomError(airdrop, "NonValidProof");
+    });
+
+    it("should revert if already claimed", async function () {
+      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+
+      const amount = ethers.parseEther("500");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 1, root);
+    
+      await ethers.provider.send("evm_increaseTime", [86400 + 1]);
+      await ethers.provider.send("evm_mine");
+
+      await airdrop.connect(user1).claim(1, amount, proof);
+
+      await expect(
+        airdrop.connect(user1).claim(1, amount, proof)
+      ).to.be.revertedWithCustomError(airdrop, "AlreadyClaimed");
     });
   });
 
-  describe("Errors and Complex Behavior", function () {
-    it("should revert if uploadParticipants with empty array", async function () {
-      const { airdrop } = await loadFixture(deployAirdropFixture);
+  describe("Withdraw Unclaimed", function () {
+    it("should withdraw correct unclaimed amount after partial claims", async function () {
+      const { owner, user1, user2, token, airdrop } = await loadFixture(deployAirdropFixture);
 
-      await expect(airdrop.uploadParticipants([], 1)).to.be.revertedWithCustomError(airdrop, "EmptyDistributionArray");
-    });
+      const totalAmount = ethers.parseEther("1000");
+      await token.approve(await airdrop.getAddress(), totalAmount);
+      await airdrop.startCampaign(await token.getAddress(), totalAmount);
 
-    it("should revert if campaign is finalized and trying to upload more participants", async function () {
-      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+      const recipients = [
+        { address: user1.address, amount: ethers.parseEther("300") },
+        { address: user2.address, amount: ethers.parseEther("700") }
+      ];
+      const { root, getProof } = createMerkleTree(recipients);
 
-      const totalAllocated = ethers.parseEther("1000");
-      await token.approve(await airdrop.getAddress(), totalAllocated);
-      await airdrop.startCampaign(await token.getAddress(), totalAllocated);
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 1, root);
 
-      const participants = [{ user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }];
-      await airdrop.uploadParticipants(participants, 1);
-
-      const now = (await ethers.provider.getBlock("latest")).timestamp;
-      await airdrop.finalizeCampaign(1, now + 1, 10);
-
-      const newParticipants = [{ user: user1.address, amount: ethers.parseEther("200"), campaignId: 1 }];
-
-      await expect(airdrop.uploadParticipants(newParticipants, 1)).to.be.revertedWithCustomError(airdrop, "CampaignFinalized");
-    });
-
-    it("should revert claim before campaign finalized", async function () {
-      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-
-      const totalAllocated = ethers.parseEther("1000");
-      await token.approve(await airdrop.getAddress(), totalAllocated);
-      await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-
-      const participants = [{ user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }];
-      await airdrop.uploadParticipants(participants, 1);
-
-      await expect(airdrop.connect(user1).claim(1, ethers.parseEther("50")))
-        .to.be.revertedWithCustomError(airdrop, "CampaignNotAllowed");
-    });
-
-    it("should revert claim if user has zero allocation", async function () {
-      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-
-      const totalAllocated = ethers.parseEther("1000");
-      await token.approve(await airdrop.getAddress(), totalAllocated);
-      await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-
-      const now = (await ethers.provider.getBlock("latest")).timestamp;
-      await airdrop.finalizeCampaign(1, now + 1, 10);
-
-      await network.provider.send("evm_increaseTime", [2 * 86400]);
-      await network.provider.send("evm_mine");
-
-      await expect(airdrop.connect(user1).claim(1, ethers.parseEther("50")))
-        .to.be.revertedWithCustomError(airdrop, "AlreadyClaimed");
-    });
-
-    it("should revert uploadParticipants if allocation exceeds totalAllocated", async function () {
-      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-
-      const totalAllocated = ethers.parseEther("100");
-      await token.approve(await airdrop.getAddress(), totalAllocated);
-      await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-
-      const participants = [{ user: user1.address, amount: ethers.parseEther("101"), campaignId: 1 }];
-
-      await expect(airdrop.uploadParticipants(participants, 1))
-        .to.be.revertedWithCustomError(airdrop, "InvalidDistributionSum");
-    });
-
-    it("should not allow to claim more than vested amount (TooManyForWitdraw)", async function () {
-      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-
-      const totalAllocated = ethers.parseEther("1000");
-      await token.approve(await airdrop.getAddress(), totalAllocated);
-      await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-
-      const participants = [{ user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }];
-      await airdrop.uploadParticipants(participants, 1);
-
-      const now = (await ethers.provider.getBlock("latest")).timestamp;
-      await airdrop.finalizeCampaign(1, now + 1, 1);
-
-      await network.provider.send("evm_increaseTime", [2 * 86400]);
-      await network.provider.send("evm_mine");
-
-      await expect(airdrop.connect(user1).claim(1, ethers.parseEther("200")))
-        .to.be.revertedWithCustomError(airdrop, "TooManyForWitdraw");
-    });
-
-    it("should allow partial claims and update balances properly", async function () {
-      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-
-      const totalAllocated = ethers.parseEther("1000");
-      await token.approve(await airdrop.getAddress(), totalAllocated);
-      await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-
-      const participants = [{ user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }];
-      await airdrop.uploadParticipants(participants, 1);
-
-      const now = (await ethers.provider.getBlock("latest")).timestamp;
-      await airdrop.finalizeCampaign(1, now + 1, 1);
-
-      await network.provider.send("evm_increaseTime", [2 * 86400]);
-      await network.provider.send("evm_mine");
-
-      const beforeBalance = await token.balanceOf(user1.address);
-
-      await airdrop.connect(user1).claim(1, ethers.parseEther("30"));
-
-      const afterBalance1 = await token.balanceOf(user1.address);
-      expect(afterBalance1 - beforeBalance).to.equal(ethers.parseEther("30"));
-
-      await airdrop.connect(user1).claim(1, ethers.parseEther("70"));
-
-      const afterBalance2 = await token.balanceOf(user1.address);
-      expect(afterBalance2 - beforeBalance).to.equal(ethers.parseEther("100"));
-    });
-
-    it("should emit DestributionChanged when updating existing participant", async function () {
-        const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-      
-        const totalAllocated = ethers.parseEther("1000");
-        await token.approve(await airdrop.getAddress(), totalAllocated);
-        await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-      
-        const participants1 = [{ user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }];
-        await airdrop.uploadParticipants(participants1, 1);
-
-        const participants2 = [{ user: user1.address, amount: ethers.parseEther("200"), campaignId: 1 }];
-        
-        await expect(airdrop.uploadParticipants(participants2, 1))
-          .to.emit(airdrop, "DestributionChanged")
-          .withArgs(user1.address, ethers.parseEther("200"));
-    });
-
-    it("should not handle zero duration in finalizeCampaign", async function () {
-        const { token, airdrop } = await loadFixture(deployAirdropFixture);
-      
-        const totalAllocated = ethers.parseEther("1000");
-        await token.approve(await airdrop.getAddress(), totalAllocated);
-        await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-      
-        const now = (await ethers.provider.getBlock("latest")).timestamp;
-        
-        await expect(airdrop.finalizeCampaign(1, now + 10, 0)).to.be.revertedWithCustomError(airdrop, "DurationMustBeNotNull");
-    });
-
-    it("should allow full claim after vesting period ends", async function () {
-        const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-      
-        const totalAllocated = ethers.parseEther("1000");
-        await token.approve(await airdrop.getAddress(), totalAllocated);
-        await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-      
-        const participants = [{ user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }];
-        await airdrop.uploadParticipants(participants, 1);
-      
-        const now = (await ethers.provider.getBlock("latest")).timestamp;
-        await airdrop.finalizeCampaign(1, now + 1, 1);
-      
-        await network.provider.send("evm_increaseTime", [2 * 86400]);
-        await network.provider.send("evm_mine");
-      
-        const beforeBalance = await token.balanceOf(user1.address);
-        await airdrop.connect(user1).claim(1, ethers.parseEther("100"));
-        const afterBalance = await token.balanceOf(user1.address);
-      
-        expect(afterBalance - beforeBalance).to.equal(ethers.parseEther("100"));
-        expect(await airdrop.campaignDistribution(1, user1.address)).to.equal(0);
-    });
-
-    it("should handle multiple partial claims during vesting", async function () {
-        const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-      
-        const totalAllocated = ethers.parseEther("1000");
-        await token.approve(await airdrop.getAddress(), totalAllocated);
-        await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-      
-        const participants = [{ user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }];
-        await airdrop.uploadParticipants(participants, 1);
-      
-        const now = (await ethers.provider.getBlock("latest")).timestamp;
-        await airdrop.finalizeCampaign(1, now + 1, 10); 
-      
-        await network.provider.send("evm_increaseTime", [2 * 86400]);
-        await network.provider.send("evm_mine");
-        await airdrop.connect(user1).claim(1, ethers.parseEther("20"));
+      const user1Proof = getProof(user1.address, recipients[0].amount);
+      await ethers.provider.send("evm_increaseTime", [43200]); 
+      await ethers.provider.send("evm_mine");
+      await airdrop.connect(user1).claim(1, recipients[0].amount, user1Proof);
     
-        await network.provider.send("evm_increaseTime", [5 * 86400]);
-        await network.provider.send("evm_mine");
-        await airdrop.connect(user1).claim(1, ethers.parseEther("50"));
-      
-        await network.provider.send("evm_increaseTime", [3 * 86400]);
-        await network.provider.send("evm_mine");
-        await airdrop.connect(user1).claim(1, ethers.parseEther("30"));
-      
-        expect(await airdrop.campaignDistribution(1, user1.address)).to.equal(0);
+      await ethers.provider.send("evm_increaseTime", [43200 + 1]);
+      await ethers.provider.send("evm_mine");
+
+      const ownerBalanceBefore = await token.balanceOf(owner.address);
+      await airdrop.withdrawUnclaimed(1);
+      const ownerBalanceAfter = await token.balanceOf(owner.address);
+
+      const expectedWithdrawn = ethers.parseEther("850");
+      expect(ownerBalanceAfter - ownerBalanceBefore).to.be.closeTo(
+        expectedWithdrawn,
+        expectedWithdrawn / 100n 
+      );
     });
 
-    it("should revert when non-owner tries to start campaign", async function () {
-        const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-      
-        const totalAllocated = ethers.parseEther("1000");
-        await token.approve(await airdrop.getAddress(), totalAllocated);
-        
-        await expect(airdrop.connect(user1).startCampaign(await token.getAddress(), totalAllocated)).to.be.reverted;
-    });
-      
-    it("should revert when non-owner tries to upload participants", async function () {
-        const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
-      
-        const totalAllocated = ethers.parseEther("1000");
-        await token.approve(await airdrop.getAddress(), totalAllocated);
-        await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-      
-        const participants = [{ user: user1.address, amount: ethers.parseEther("100"), campaignId: 1 }];
-        
-        await expect(airdrop.connect(user1).uploadParticipants(participants, 1))
-          .to.be.reverted;
+    it("should revert if non-owner tries to withdraw", async function () {
+      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+
+      const amount = ethers.parseEther("500");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 1, ethers.ZeroHash);
+
+      await ethers.provider.send("evm_increaseTime", [86400 + 1]);
+      await ethers.provider.send("evm_mine");
+
+      await expect(
+        airdrop.connect(user1).withdrawUnclaimed(1)
+      ).to.be.revertedWithCustomError(airdrop, "OwnableUnauthorizedAccount");
     });
 
-    it("should return correct campaign state", async function () {
-        const { token, airdrop } = await loadFixture(deployAirdropFixture);
-      
-        const totalAllocated = ethers.parseEther("1000");
-        await token.approve(await airdrop.getAddress(), totalAllocated);
-        await airdrop.startCampaign(await token.getAddress(), totalAllocated);
-      
-        let campaign = await airdrop.campaigns(1);
-        expect(campaign.finalized).to.be.false;
-        expect(campaign.totalAllocated).to.equal(totalAllocated);
-      
-        const now = (await ethers.provider.getBlock("latest")).timestamp;
-        await airdrop.finalizeCampaign(1, now + 10, 30);
-        
-        campaign = await airdrop.campaigns(1);
-        expect(campaign.finalized).to.be.true;
-        expect(campaign.vestingStart).to.equal(now + 10);
-        expect(campaign.vestingEnd).to.equal(now + 10 + (30 * 86400));
+    it("should allow owner to withdraw unclaimed tokens after vesting", async function () {
+      const { owner, user1, user2, token, airdrop } = await loadFixture(deployAirdropFixture);
+
+      const totalAmount = ethers.parseEther("1000");
+      await token.approve(await airdrop.getAddress(), totalAmount);
+      await airdrop.startCampaign(await token.getAddress(), totalAmount);
+
+      const recipients = [
+        { address: user1.address, amount: ethers.parseEther("300") },
+        { address: user2.address, amount: ethers.parseEther("700") }
+      ];
+      const { root, getProof } = createMerkleTree(recipients);
+
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 1, root);
+
+      const user1Proof = getProof(user1.address, recipients[0].amount);
+      await airdrop.connect(user1).claim(1, recipients[0].amount, user1Proof);
+    
+      await ethers.provider.send("evm_increaseTime", [86400 + 1]);
+      await ethers.provider.send("evm_mine");
+
+      const ownerBalanceBefore = await token.balanceOf(owner.address);
+      await airdrop.withdrawUnclaimed(1);
+      const ownerBalanceAfter = await token.balanceOf(owner.address);
+
+      expect(ownerBalanceAfter).to.greaterThan(ownerBalanceBefore);
+    });
+
+    it("should revert if vesting not ended", async function () {
+      const { token, airdrop } = await loadFixture(deployAirdropFixture);
+
+      const amount = ethers.parseEther("500");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 4, ethers.ZeroHash);
+
+      await ethers.provider.send("evm_increaseTime", [86400 + 1]);
+      await ethers.provider.send("evm_mine");
+
+      await expect(
+        airdrop.withdrawUnclaimed(1)
+      ).to.be.revertedWithCustomError(airdrop, "VestingPeriodNotEnded");
+    });
+  });
+
+  describe("Edge Cases", function () {
+    it("should handle very small allocations correctly", async function () {
+      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+    
+      const amount = ethers.parseEther("0.000001");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+    
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+    
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 1, root);
+    
+      await ethers.provider.send("evm_increaseTime", [86400 + 1]);
+      await ethers.provider.send("evm_mine");
+    
+      await expect(airdrop.connect(user1).claim(1, amount, proof))
+        .to.emit(airdrop, "TokensClaimed")
+        .withArgs(1, user1.address, amount);
+    
+      expect(await token.balanceOf(user1.address)).to.equal(amount);
+    });
+
+    it("should handle very large allocations correctly", async function () {
+      const { owner, user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+    
+      const amount = ethers.parseEther("1000000");
+      await token.mint(owner.address, amount);
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+    
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+    
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 1, root);
+    
+      await ethers.provider.send("evm_increaseTime", [86400 + 1]);
+      await ethers.provider.send("evm_mine");
+    
+      await expect(airdrop.connect(user1).claim(1, amount, proof))
+        .to.emit(airdrop, "TokensClaimed")
+        .withArgs(1, user1.address, amount);
+    
+      expect(await token.balanceOf(user1.address)).to.equal(amount);
+    });
+
+    it("should handle very long vesting periods correctly", async function () {
+      const { user1, token, airdrop } = await loadFixture(deployAirdropFixture);
+    
+      const amount = ethers.parseEther("1000");
+      await token.approve(await airdrop.getAddress(), amount);
+      await airdrop.startCampaign(await token.getAddress(), amount);
+    
+      const recipients = [{ address: user1.address, amount }];
+      const { root, getProof } = createMerkleTree(recipients);
+      const proof = getProof(user1.address, amount);
+    
+      const now = (await ethers.provider.getBlock("latest"))!.timestamp;
+      await airdrop.finalizeCampaign(1, now + 1, 365, root);
+    
+      await ethers.provider.send("evm_increaseTime", [30 * 86400]);
+      await ethers.provider.send("evm_mine");
+    
+      await airdrop.connect(user1).claim(1, amount, proof);
+      const expectedAmount = amount * 30n / 365n;
+      expect(await token.balanceOf(user1.address)).to.be.closeTo(
+        expectedAmount,
+        expectedAmount / 100n
+      );
     });
   });
 });

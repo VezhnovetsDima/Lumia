@@ -1,5 +1,28 @@
 # Airdrop Smart Contract System
 
+## How to use for checking person
+
+1) It is not gpt comments, It is NatSpec docs. It is standart for solidity programming (https://docs.soliditylang.org/en/latest/natspec-format.html). Structure fields got description for better understanding what each field means.
+
+
+3) how to deploy locally
+3.1)npm i - install dependencies
+3.2)npx hardhat node - start local blockchain, there are 20 test addresses and their private keys
+3.3)deploy our contract in local testnet. Just use specially prepared script in script package. To use it run this command npx hardhat run script/deploy.ts --network localhost. if you want to deploy to mainnet you need to specify --network ethereum. As a result you will see the deployed contract address. If you deploy in localhost there is a special TestToken contract.
+
+3.4)Start new campaign - npx hardhat run .\script\initCampaign.ts --network localhost. We need to specify: address of deployed contract, address of token, amount of tokens for airdrop campaign.
+
+3.5)Finalize campaign npx hardhat run .\script\finalizeCampaign.ts --network localhost. 
+
+Parameters: airdrop contract address, vestingStartDelay(if it is zero vestings starts right now), durationInDays length of vesting period from start date,gasLimit: gasLimit, campaignIds - campaign ids we want to finalize, csvPath - path to csv file with participants. 
+
+Includes: read multiple participants csv, build merkleProof(can finalize many campaigns in one call), then write the execution results in console.
+
+3.6)Claim airdrop to user npx hardhat run .\script\claim.ts --network localhost. Paremeter: contractAddress - airdrop contract address, userAddress - address of user who claimin, privateKey - user private key, campaignId - campaign user wants to claim, csvFilePath - path to csv(can be changed to sql database iterraction or something else) to evaluate proofs for user, gasLimit - gasLimit for transaction. Includes: building tree and counting proofs, sending transaction, output result
+
+3.7)withdrawUnclaimed //todo функция дополнительная, задумался что моедт быть полезной, если нужно напишу скрипт
+
+
 ## 1. Overview
 We are developing a reusable Airdrop Smart Contract designed to manage multiple token distribution campaigns (airdrops).
 
