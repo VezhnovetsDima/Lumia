@@ -92,4 +92,3 @@ claimTokens(
   "script/test.csv",                             
   500000                                         
 );
-

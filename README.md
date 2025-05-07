@@ -20,7 +20,7 @@ Includes: read multiple participants csv, build merkleProof(can finalize many ca
 
 3.6)Claim airdrop to user npx hardhat run .\script\claim.ts --network localhost. Paremeter: contractAddress - airdrop contract address, userAddress - address of user who claimin, privateKey - user private key, campaignId - campaign user wants to claim, csvFilePath - path to csv(can be changed to sql database iterraction or something else) to evaluate proofs for user, gasLimit - gasLimit for transaction. Includes: building tree and counting proofs, sending transaction, output result
 
-3.7)withdrawUnclaimed //todo функция дополнительная, задумался что моедт быть полезной, если нужно напишу скрипт
+3.7)withdrawUnclaimed //todo функция дополнительная, задумался что может быть полезной, если нужно напишу скрипт
 
 
 ## 1. Overview
